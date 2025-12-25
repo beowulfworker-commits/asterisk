@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+!/usr/bin/env bash
 set -euo pipefail
 
 # =========================
@@ -279,7 +279,10 @@ install_packages() {
   run apt-get "${apt_opts[@]}" upgrade
 
   run apt-get "${apt_opts[@]}" install --no-install-recommends \
-    asterisk \
+    asterisk-core \
+    asterisk-modules \
+    asterisk-pjsip \
+    asterisk-config \
     fail2ban \
     nftables \
     curl \
@@ -644,4 +647,5 @@ main() {
 }
 
 main "$@"
+
 
