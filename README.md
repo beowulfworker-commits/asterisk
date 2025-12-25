@@ -1,9 +1,9 @@
-# Asterisk (PJSIP) Debian 12 — install.sh
+# Asterisk (PJSIP) Ubuntu 24.04 — install.sh
 
 Минимальный воспроизводимый установщик: Asterisk (PJSIP) + 12 SIP пользователей + nftables + fail2ban.
 
 ## Запуск
-1) Скопируйте репозиторий на чистую VPS с Debian 12.
+1) Скопируйте репозиторий на чистую VPS с Ubuntu 24.04 LTS.
 2) Запустите:
    sudo ./install.sh
 

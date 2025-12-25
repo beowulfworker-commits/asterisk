@@ -1,4 +1,4 @@
-apt-cache show asterisk-core >/dev/null 2>&1 || die "Asterisk packages not found in APT"
+#!/usr/bin/env bash
 
 set -euo pipefail
 
@@ -26,6 +26,7 @@ declare -a OVERRIDES=()
 
 # Runtime detected
 PUBLIC_IP=""
+OS_NAME=""
 
 # =========================
 # Logging
@@ -140,6 +141,20 @@ Examples:
   sudo ./install.sh --reset-users
   sudo ./install.sh --set SIP_PORT=5062 --set RTP_PORT_START=12000 --set RTP_PORT_END=13000
 EOF
+}
+
+detect_os() {
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    OS_NAME="${PRETTY_NAME:-${ID:-unknown} ${VERSION_ID:-}}"
+  else
+    die "Cannot detect OS (missing /etc/os-release)"
+  fi
+
+  if [[ "${ID:-}" != "ubuntu" || "${VERSION_ID:-}" != 24.* ]]; then
+    die "Supported OS: Ubuntu 24.04 LTS"
+  fi
 }
 
 parse_args() {
@@ -279,23 +294,16 @@ install_packages() {
   # "Обновляет систему" (без интерактива и без слома конфигов)
   run apt-get "${apt_opts[@]}" upgrade
 
-  apt-get install -y apt-transport-https
-  
-  if ! apt-cache policy asterisk | grep -q Candidate; then
-    echo "Adding bookworm-backports for Asterisk"
-    echo "deb http://deb.debian.org/debian bookworm-backports main" \
-      >/etc/apt/sources.list.d/bookworm-backports.list
-    apt-get update
-  fi
-  
-  apt-get install -y -t bookworm-backports \
+  apt-cache show asterisk >/dev/null 2>&1 || die "Asterisk packages not found in APT (expected in Ubuntu 24.04 repos)"
+
+  run apt-get install -y \
     asterisk \
     fail2ban \
     nftables \
     curl \
     ca-certificates \
     openssl
-  }
+}
 
 configure_asterisk() {
   # Base configs from repo
@@ -584,7 +592,7 @@ write_credentials() {
 show_plan() {
   cat <<EOF
 Plan:
-- OS: Debian 12
+- OS: ${OS_NAME:-Ubuntu 24.04 LTS}
 - Packages: asterisk, fail2ban, nftables, curl, ca-certificates, openssl
 - Config:
   /etc/asterisk/pjsip.conf
@@ -619,6 +627,7 @@ EOF
 main() {
   parse_args "$@"
   check_root
+  detect_os
 
   # load env BEFORE logging redirection (dry-run must not touch files)
   load_env
