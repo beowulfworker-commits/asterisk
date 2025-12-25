@@ -279,17 +279,23 @@ install_packages() {
   # "Обновляет систему" (без интерактива и без слома конфигов)
   run apt-get "${apt_opts[@]}" upgrade
 
-  run apt-get "${apt_opts[@]}" install --no-install-recommends \
-    asterisk-core \
-    asterisk-modules \
-    asterisk-pjsip \
-    asterisk-config \
+  apt-get install -y apt-transport-https
+  
+  if ! apt-cache policy asterisk | grep -q Candidate; then
+    echo "Adding bookworm-backports for Asterisk"
+    echo "deb http://deb.debian.org/debian bookworm-backports main" \
+      >/etc/apt/sources.list.d/bookworm-backports.list
+    apt-get update
+  fi
+  
+  apt-get install -y -t bookworm-backports \
+    asterisk \
     fail2ban \
     nftables \
     curl \
     ca-certificates \
     openssl
-}
+  }
 
 configure_asterisk() {
   # Base configs from repo
@@ -648,6 +654,7 @@ main() {
 }
 
 main "$@"
+
 
 
 
