@@ -1,4 +1,5 @@
-!/usr/bin/env bash
+apt-cache show asterisk-core >/dev/null 2>&1 || die "Asterisk packages not found in APT"
+
 set -euo pipefail
 
 # =========================
@@ -647,5 +648,6 @@ main() {
 }
 
 main "$@"
+
 
 
