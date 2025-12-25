@@ -198,7 +198,7 @@ load_env() {
   RTP_PORT_END="${RTP_PORT_END:-20000}"
 
   LOCAL_NET="${LOCAL_NET:-10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}"
-  TIMEZONE="${TIMEZONE:-Europe/Warsaw}"
+  TIMEZONE="${TIMEZONE:-Europe/Moscow}"
 
   ALLOW_SSH_FROM="${ALLOW_SSH_FROM:-}"
 
@@ -644,3 +644,4 @@ main() {
 }
 
 main "$@"
+
