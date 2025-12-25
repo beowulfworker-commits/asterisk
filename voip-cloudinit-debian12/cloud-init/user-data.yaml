@@ -1,0 +1,543 @@
+#cloud-config
+
+# ====== EDIT THESE BEFORE USE ======
+# 1) Replace SSH keys for voipadmin below
+# 2) (Optional) Edit /etc/voip-bootstrap.env content below
+# ==================================
+
+timezone: Europe/Warsaw
+ssh_pwauth: false
+disable_root: true
+
+users:
+  - name: voipadmin
+    gecos: VoIP Admin
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ssh-ed25519 REPLACE_ME_ADMIN_KEY_1
+      - ssh-ed25519 REPLACE_ME_ADMIN_KEY_2
+
+write_files:
+  - path: /etc/voip-bootstrap.env
+    owner: root:root
+    permissions: '0600'
+    content: |
+      # VoIP bootstrap variables (read by /opt/voip/scripts/bootstrap.sh)
+      SIP_USERS_BASE=1001
+      SIP_USERS_COUNT=12
+      
+      # random | preset
+      SIP_PASSWORD_MODE=random
+      
+      # If SIP_PASSWORD_MODE=preset:
+      # - single password for all users:   SIP_PASSWORD_PRESET=MyStrongPass
+      # - per-user pattern using {ext}:    SIP_PASSWORD_PRESET=MyStrongPass-{ext}
+      SIP_PASSWORD_PRESET=ChangeMe-{ext}
+      
+      RTP_PORT_START=10000
+      RTP_PORT_END=20000
+      
+      SIP_PORT=5060
+      
+      # Comma-separated list
+      LOCAL_NET=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+      
+      TIMEZONE=Europe/Warsaw
+      
+      # Optional. If set, SSH доступ будет разрешен только с этого IP/CIDR.
+      # Примеры: 203.0.113.10/32  или  198.51.100.0/24
+      ALLOW_SSH_FROM=
+  - path: /opt/voip/scripts/bootstrap.sh
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      
+      LOG_FILE="/var/log/voip-bootstrap.log"
+      mkdir -p "$(dirname "$LOG_FILE")"
+      touch "$LOG_FILE"
+      chmod 600 "$LOG_FILE"
+      exec > >(tee -a "$LOG_FILE") 2>&1
+      
+      umask 077
+      
+      echo "=== voip-bootstrap started: $(date -Is) ==="
+      
+      if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+        echo "ERROR: must run as root"
+        exit 1
+      fi
+      
+      ENV_FILE="/etc/voip-bootstrap.env"
+      if [[ -f "$ENV_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$ENV_FILE"
+      else
+        echo "WARN: $ENV_FILE not found; using defaults"
+      fi
+      
+      SIP_USERS_BASE="${SIP_USERS_BASE:-1001}"
+      SIP_USERS_COUNT="${SIP_USERS_COUNT:-12}"
+      SIP_PASSWORD_MODE="${SIP_PASSWORD_MODE:-random}"   # random|preset
+      SIP_PASSWORD_PRESET="${SIP_PASSWORD_PRESET:-ChangeMe-{ext}}"
+      RTP_PORT_START="${RTP_PORT_START:-10000}"
+      RTP_PORT_END="${RTP_PORT_END:-20000}"
+      SIP_PORT="${SIP_PORT:-5060}"
+      LOCAL_NET="${LOCAL_NET:-10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}"
+      TIMEZONE="${TIMEZONE:-Etc/UTC}"
+      ALLOW_SSH_FROM="${ALLOW_SSH_FROM:-}"
+      
+      BASE_DIR="/opt/voip"
+      STATE_DIR="/var/lib/voip-bootstrap"
+      USERS_FILE="$STATE_DIR/users.csv"
+      CRED_FILE="/root/voip_credentials.txt"
+      
+      mkdir -p "$STATE_DIR"
+      chmod 700 "$STATE_DIR"
+      
+      is_ipv4() {
+        local ip="$1"
+        [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+      }
+      
+      detect_public_ip() {
+        local ip=""
+        if command -v curl >/dev/null 2>&1; then
+          ip="$(curl -fsS -4 --max-time 5 https://api.ipify.org || true)"
+        fi
+        if is_ipv4 "$ip"; then
+          echo "$ip"
+          return 0
+        fi
+      
+        ip="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)"
+        if is_ipv4 "$ip"; then
+          echo "$ip"
+          return 0
+        fi
+      
+        echo "127.0.0.1"
+      }
+      
+      trim() {
+        local s="$1"
+        # shellcheck disable=SC2001
+        echo "$s" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+      }
+      
+      PUBLIC_IP="$(detect_public_ip)"
+      echo "PUBLIC_IP=$PUBLIC_IP"
+      
+      export DEBIAN_FRONTEND=noninteractive
+      
+      if command -v timedatectl >/dev/null 2>&1; then
+        timedatectl set-timezone "$TIMEZONE" || true
+      fi
+      
+      echo "Updating apt index..."
+      apt-get update -y
+      
+      echo "Installing packages..."
+      apt-get install -y --no-install-recommends \
+        asterisk \
+        fail2ban \
+        nftables \
+        curl \
+        ca-certificates \
+        openssl
+      
+      echo "Ensuring services enabled..."
+      systemctl enable --now nftables || true
+      systemctl enable --now fail2ban || true
+      
+      gen_pass() {
+        openssl rand -hex 8
+      }
+      
+      if [[ -s "$USERS_FILE" ]]; then
+        echo "Using existing users file: $USERS_FILE"
+      else
+        echo "Generating $SIP_USERS_COUNT SIP users starting from $SIP_USERS_BASE -> $USERS_FILE"
+        : > "$USERS_FILE"
+        chmod 600 "$USERS_FILE"
+        for ((i=0; i< SIP_USERS_COUNT; i++)); do
+          ext=$((SIP_USERS_BASE + i))
+          if [[ "$SIP_PASSWORD_MODE" == "preset" && -n "${SIP_PASSWORD_PRESET}" ]]; then
+            pass="${SIP_PASSWORD_PRESET//\{ext\}/$ext}"
+          else
+            pass="$(gen_pass)"
+          fi
+          echo "${ext},${pass}" >> "$USERS_FILE"
+        done
+      fi
+      
+      install -D -m 0644 "$BASE_DIR/asterisk/pjsip.conf" /etc/asterisk/pjsip.conf
+      install -D -m 0644 "$BASE_DIR/asterisk/extensions.conf" /etc/asterisk/extensions.conf
+      install -D -m 0644 "$BASE_DIR/asterisk/logger.conf" /etc/asterisk/logger.conf
+      
+      generate_pjsip_transport() {
+        local out="/etc/asterisk/pjsip_transport.conf"
+        echo "Writing $out"
+        {
+          echo "; Autogenerated by voip-bootstrap on $(date -Is)"
+          echo "[transport-udp]"
+          echo "type=transport"
+          echo "protocol=udp"
+          echo "bind=0.0.0.0:${SIP_PORT}"
+          echo "external_signaling_address=${PUBLIC_IP}"
+          echo "external_signaling_port=${SIP_PORT}"
+          echo "external_media_address=${PUBLIC_IP}"
+      
+          IFS=',' read -ra nets <<< "${LOCAL_NET}"
+          for n in "${nets[@]}"; do
+            n="$(trim "$n")"
+            [[ -n "$n" ]] && echo "local_net=${n}"
+          done
+      
+          echo "allow_reload=yes"
+        } > "$out"
+      }
+      
+      generate_pjsip_endpoints() {
+        local out="/etc/asterisk/pjsip_endpoints.conf"
+        echo "Writing $out"
+        {
+          echo "; Autogenerated by voip-bootstrap on $(date -Is)"
+          echo
+          echo "[endpoint-basic](!)"
+          echo "type=endpoint"
+          echo "transport=transport-udp"
+          echo "context=internal"
+          echo "disallow=all"
+          echo "allow=ulaw,alaw"
+          echo "direct_media=no"
+          echo "rtp_symmetric=yes"
+          echo "force_rport=yes"
+          echo "rewrite_contact=yes"
+          echo "dtmf_mode=rfc4733"
+          echo
+          echo "[aor-basic](!)"
+          echo "type=aor"
+          echo "max_contacts=1"
+          echo "remove_existing=yes"
+          echo "qualify_frequency=60"
+          echo
+          echo "[auth-basic](!)"
+          echo "type=auth"
+          echo "auth_type=userpass"
+          echo
+      
+          while IFS=',' read -r ext pass; do
+            ext="$(trim "$ext")"
+            pass="$(trim "$pass")"
+            [[ -z "$ext" ]] && continue
+      
+            echo "[${ext}](endpoint-basic)"
+            echo "auth=${ext}"
+            echo "aors=${ext}"
+            echo "callerid=${ext} <${ext}>"
+            echo
+            echo "[${ext}](auth-basic)"
+            echo "username=${ext}"
+            echo "password=${pass}"
+            echo
+            echo "[${ext}](aor-basic)"
+            echo
+          done < "$USERS_FILE"
+        } > "$out"
+      }
+      
+      generate_extensions_internal() {
+        local out="/etc/asterisk/extensions_internal.conf"
+        echo "Writing $out"
+        {
+          echo "; Autogenerated by voip-bootstrap on $(date -Is)"
+          echo
+          echo "[internal]"
+          while IFS=',' read -r ext _pass; do
+            ext="$(trim "$ext")"
+            [[ -z "$ext" ]] && continue
+            echo "exten => ${ext},1,NoOp(Internal call to ${ext})"
+            echo " same => n,Dial(PJSIP/${ext},20)"
+            echo " same => n,Hangup()"
+            echo
+          done < "$USERS_FILE"
+        } > "$out"
+      }
+      
+      generate_rtp_conf() {
+        local out="/etc/asterisk/rtp.conf"
+        echo "Writing $out"
+        {
+          echo "; Autogenerated by voip-bootstrap on $(date -Is)"
+          echo "[general]"
+          echo "rtpstart=${RTP_PORT_START}"
+          echo "rtpend=${RTP_PORT_END}"
+        } > "$out"
+      }
+      
+      generate_pjsip_transport
+      generate_pjsip_endpoints
+      generate_extensions_internal
+      generate_rtp_conf
+      
+      # Set safe permissions for asterisk configs
+      chown root:asterisk /etc/asterisk/pjsip*.conf /etc/asterisk/extensions*.conf /etc/asterisk/rtp.conf /etc/asterisk/logger.conf 2>/dev/null || true
+      chmod 0640 /etc/asterisk/pjsip*.conf /etc/asterisk/extensions*.conf /etc/asterisk/rtp.conf /etc/asterisk/logger.conf 2>/dev/null || true
+      
+      render_nftables() {
+        local tpl="$BASE_DIR/firewall/nftables.conf.template"
+        local out="/etc/nftables.conf"
+      
+        echo "Writing $out from template"
+        local ssh_rule=""
+        if [[ -n "$(trim "$ALLOW_SSH_FROM")" ]]; then
+          ssh_rule="tcp dport 22 ip saddr ${ALLOW_SSH_FROM} accept"
+        else
+          ssh_rule="tcp dport 22 accept"
+        fi
+      
+        sed \
+          -e "s/__SIP_PORT__/${SIP_PORT}/g" \
+          -e "s/__RTP_START__/${RTP_PORT_START}/g" \
+          -e "s/__RTP_END__/${RTP_PORT_END}/g" \
+          -e "s|__SSH_RULE__|${ssh_rule}|g" \
+          "$tpl" > "$out"
+      }
+      
+      render_nftables
+      systemctl enable --now nftables
+      systemctl restart nftables
+      
+      install -D -m 0644 "$BASE_DIR/fail2ban/filter.d/asterisk-pjsip.conf" /etc/fail2ban/filter.d/asterisk-pjsip.conf
+      
+      render_fail2ban_jail() {
+        local tpl="$BASE_DIR/fail2ban/jail.d/asterisk-pjsip.conf.template"
+        local out="/etc/fail2ban/jail.d/asterisk-pjsip.conf"
+        echo "Writing $out from template"
+        sed -e "s/__SIP_PORT__/${SIP_PORT}/g" "$tpl" > "$out"
+      }
+      
+      render_fail2ban_jail
+      systemctl enable --now fail2ban
+      systemctl restart fail2ban
+      
+      systemctl enable --now asterisk
+      systemctl restart asterisk
+      
+      echo "Waiting for Asterisk CLI..."
+      for i in {1..30}; do
+        if asterisk -rx "core show uptime" >/dev/null 2>&1; then
+          break
+        fi
+        sleep 1
+      done
+      
+      echo "Asterisk status:"
+      systemctl --no-pager --full status asterisk || true
+      
+      echo "PJSIP endpoints:"
+      asterisk -rx "pjsip show endpoints" || true
+      
+      write_credentials() {
+        echo "Writing $CRED_FILE"
+        {
+          echo "Server: ${PUBLIC_IP}"
+          echo "SIP: ${PUBLIC_IP}:${SIP_PORT} (UDP)"
+          echo "RTP: ${RTP_PORT_START}-${RTP_PORT_END} (UDP)"
+          echo "Transport: UDP"
+          echo "Codecs: ulaw, alaw"
+          echo
+          echo "Users:"
+          while IFS=',' read -r ext pass; do
+            ext="$(trim "$ext")"
+            pass="$(trim "$pass")"
+            [[ -z "$ext" ]] && continue
+            printf "%s\t%s\n" "$ext" "$pass"
+          done < "$USERS_FILE"
+          echo
+          echo "Asterisk logs: /var/log/asterisk/messages"
+          echo "Bootstrap log: $LOG_FILE"
+        } > "$CRED_FILE"
+        chmod 600 "$CRED_FILE"
+      }
+      
+      write_credentials
+      
+      echo "=== voip-bootstrap finished: $(date -Is) ==="
+  - path: /opt/voip/asterisk/pjsip.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      ; /etc/asterisk/pjsip.conf
+      ; Managed by voip-bootstrap (do not edit manually)
+      ;
+      ; Generated parts (created by /opt/voip/scripts/bootstrap.sh):
+      ;   - /etc/asterisk/pjsip_transport.conf
+      ;   - /etc/asterisk/pjsip_endpoints.conf
+      
+      [global]
+      type=global
+      user_agent=VoIP-VPS
+      endpoint_identifier_order=auth_username,username,ip,anonymous
+      
+      #include pjsip_transport.conf
+      #include pjsip_endpoints.conf
+  - path: /opt/voip/asterisk/extensions.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      ; /etc/asterisk/extensions.conf
+      ; Managed by voip-bootstrap (do not edit manually)
+      ;
+      ; Generated part:
+      ;   - /etc/asterisk/extensions_internal.conf
+      
+      [general]
+      static=yes
+      writeprotect=no
+      clearglobalvars=no
+      
+      #include extensions_internal.conf
+  - path: /opt/voip/asterisk/logger.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      ; /etc/asterisk/logger.conf
+      ; Managed by voip-bootstrap (do not edit manually)
+      
+      [general]
+      dateformat=%F %T
+      
+      [logfiles]
+      ; A full log (useful for troubleshooting)
+      full => notice,warning,error,debug,verbose
+      
+      ; A smaller log used by fail2ban (keep it readable)
+      messages => notice,warning,error,security
+  - path: /opt/voip/fail2ban/filter.d/asterisk-pjsip.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      # Fail2ban filter for Asterisk PJSIP auth/endpoint failures
+      #
+      # Log source: /var/log/asterisk/messages (see /etc/asterisk/logger.conf)
+      #
+      # Matches typical lines like:
+      # [2025-12-24 12:34:56] NOTICE[1234]: res_pjsip/pjsip_distributor.c:... failed for '1.2.3.4:5060' ... - Failed to authenticate
+      # [2025-12-24 12:34:56] NOTICE[1234]: res_pjsip/pjsip_distributor.c:... failed for '1.2.3.4:5060' ... - No matching endpoint found
+      
+      [Definition]
+      datepattern = ^\[%Y-%m-%d %H:%M:%S\]
+      
+      failregex = ^\[[^\]]+\]\s+(NOTICE|WARNING)\[[0-9]+\]:\s+res_pjsip/pjsip_distributor\.c:.*failed for '<HOST>:\d+'.* - (Failed to authenticate|No matching endpoint found).*
+                  ^\[[^\]]+\]\s+(NOTICE|WARNING)\[[0-9]+\]:\s+res_pjsip/pjsip_distributor\.c:.*failed for '<HOST>:\d+'.* - Request\s+'\.\*'\s+from\s+'\.\*'\.\*
+      ignoreregex =
+  - path: /opt/voip/fail2ban/jail.d/asterisk-pjsip.conf.template
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [asterisk-pjsip]
+      enabled = true
+      filter = asterisk-pjsip
+      logpath = /var/log/asterisk/messages
+      
+      maxretry = 5
+      findtime = 10m
+      bantime = 1h
+      
+      backend = auto
+      
+      # Ban using nftables on the SIP UDP port
+      action = nftables-multiport[name=asterisk-pjsip, port="__SIP_PORT__", protocol=udp]
+  - path: /opt/voip/firewall/nftables.conf.template
+    owner: root:root
+    permissions: '0644'
+    content: |
+      #!/usr/sbin/nft -f
+      
+      flush ruleset
+      
+      define SSH_PORT = 22
+      define SIP_PORT = __SIP_PORT__
+      define RTP_START = __RTP_START__
+      define RTP_END   = __RTP_END__
+      
+      table inet filter {
+        chain input {
+          type filter hook input priority 0;
+          policy drop;
+      
+          iifname "lo" accept
+          ct state established,related accept
+      
+          ip protocol icmp accept
+          ip6 nexthdr icmpv6 accept
+      
+          __SSH_RULE__
+      
+          udp dport $SIP_PORT accept
+          udp dport $RTP_START-$RTP_END accept
+        }
+      
+        chain forward {
+          type filter hook forward priority 0;
+          policy drop;
+        }
+      
+        chain output {
+          type filter hook output priority 0;
+          policy accept;
+        }
+      }
+  - path: /opt/voip/README.md
+    owner: root:root
+    permissions: '0644'
+    content: |
+      # VoIP Cloud-init (Debian 12 + Asterisk PJSIP)
+      
+      Этот комплект делает полностью готовый к использованию Asterisk (PJSIP) сервер при первом запуске VPS через cloud-init.
+      
+      ## Что получится
+      - Debian 12 + Asterisk (PJSIP)
+      - 12 SIP пользователей (по умолчанию 1001–1012)
+      - Внутренние звонки между ними
+      - nftables firewall (SSH + SIP + RTP)
+      - fail2ban (бан по попыткам подбора SIP)
+      - Файл с учетками: /root/voip_credentials.txt
+      - Лог установки: /var/log/voip-bootstrap.log
+      
+      ## Как использовать
+      1) Создайте VPS с образом **Debian 12**.
+      2) В панели VPS включите **cloud-init / user-data** и вставьте содержимое `cloud-init/user-data.yaml`.
+      3) В `user-data.yaml` обязательно замените SSH ключи в секции пользователя `voipadmin`.
+      4) Дождитесь первого запуска (обычно несколько минут), затем зайдите по SSH:
+         - `ssh voipadmin@<SERVER_IP>`
+      5) Посмотрите результат:
+         - `sudo cat /root/voip_credentials.txt`
+         - `sudo tail -n 200 /var/log/voip-bootstrap.log`
+      
+      ## Подключение софтфона (Zoiper / Linphone)
+      Параметры:
+      - **Domain/Host**: публичный IP сервера
+      - **Port**: 5060
+      - **Transport**: UDP
+      - **Username**: 1001 (или другой)
+      - **Password**: из `/root/voip_credentials.txt`
+      - **Codecs**: PCMU/PCMA (ulaw/alaw)
+      
+      ## Звонки
+      Наберите номер другого пользователя (например 1002) — вызов пойдет через `Dial(PJSIP/1002)`.
+      
+      ## Важно
+      - Если вы задаёте `ALLOW_SSH_FROM`, укажите корректный ваш IP/CIDR, иначе можно закрыть SSH доступ.
+      - Скрипт идемпотентный: при повторном запуске не ломает систему и не меняет пароли, если файл пользователей уже создан.
+
+runcmd:
+  - [ bash, -lc, "/opt/voip/scripts/bootstrap.sh" ]
+
+final_message: "VoIP server provisioned. Credentials: /root/voip_credentials.txt"

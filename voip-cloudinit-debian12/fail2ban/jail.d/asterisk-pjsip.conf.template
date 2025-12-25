@@ -1,0 +1,13 @@
+[asterisk-pjsip]
+enabled = true
+filter = asterisk-pjsip
+logpath = /var/log/asterisk/messages
+
+maxretry = 5
+findtime = 10m
+bantime = 1h
+
+backend = auto
+
+# Ban using nftables on the SIP UDP port
+action = nftables-multiport[name=asterisk-pjsip, port="__SIP_PORT__", protocol=udp]
